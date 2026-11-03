@@ -1262,7 +1262,7 @@ pub fn remove_user_profile(name: String) -> Result<usize, String> {
 
 fn styles_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     use tauri::Manager;
-    let dir = app.path().app_data_dir().map_err(|e| e.to_string())?.join("styles");
+    let dir = crate::portable::app_data_dir(app)?.join("styles");
     std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     Ok(dir)
 }
