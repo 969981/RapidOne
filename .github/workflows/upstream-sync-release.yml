@@ -31,6 +31,9 @@ jobs:
       tag: ${{ steps.sync.outputs.tag }}
       sha: ${{ steps.sync.outputs.sha }}
       upstream_sha: ${{ steps.sync.outputs.upstream_sha }}
+      upstream_release: ${{ steps.sync.outputs.upstream_release }}
+      mirror_tag: ${{ steps.sync.outputs.mirror_tag }}
+      mirror_needed: ${{ steps.sync.outputs.mirror_needed }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -41,6 +44,7 @@ jobs:
         shell: bash
         env:
           FORCE: ${{ inputs.force_release || 'false' }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           git config user.name 'github-actions[bot]'
@@ -58,6 +62,19 @@ jobs:
           fi
 
           echo "upstream_sha=$upstream_sha" >> "$GITHUB_OUTPUT"
+          # Track upstream releases independently from source commits:
+          # a release may be published after its source commit.
+          upstream_release="$(gh api repos/crispin81/RapidOne/releases/latest --jq '.tag_name')"
+          mirror_tag="upstream-${upstream_release}"
+          mirror_needed=true
+          if gh release view "$mirror_tag" >/dev/null 2>&1; then
+            mirror_needed=false
+          fi
+          {
+            echo "upstream_release=$upstream_release"
+            echo "mirror_tag=$mirror_tag"
+            echo "mirror_needed=$mirror_needed"
+          } >> "$GITHUB_OUTPUT"
           if [[ "$changed" != true && "$FORCE" != true && "$GITHUB_EVENT_NAME" != push ]]; then
             echo 'No upstream change. Skip build.'
             echo 'build=false' >> "$GITHUB_OUTPUT"
@@ -83,10 +100,11 @@ jobs:
 
   dependency-check:
     needs: sync
-    if: needs.sync.outputs.build == 'true'
     runs-on: ubuntu-latest
+    outputs:
+      available: ${{ steps.check.outputs.available }}
     steps:
-      - name: Authenticate to optional private upstream module repositories
+      - name: Authenticate to upstream modules if separately authorized
         shell: bash
         env:
           MODULES_TOKEN: ${{ secrets.RAPIDONE_MODULES_TOKEN }}
@@ -94,23 +112,34 @@ jobs:
           if [[ -n "$MODULES_TOKEN" ]]; then
             git config --global url."https://x-access-token:${MODULES_TOKEN}@github.com/".insteadOf "https://github.com/"
           fi
-      - name: Verify source dependencies are fetchable
+
+      - id: check
+        name: Check optional private-source compilation prerequisites
         shell: bash
         env:
           GIT_TERMINAL_PROMPT: '0'
         run: |
           set -euo pipefail
+          missing=false
           for repo in crispin81/RapidCulling-module crispin81/RapidRetouch-module; do
-            echo "Checking $repo (branch module)"
-            if ! git ls-remote --exit-code "https://github.com/$repo.git" refs/heads/module >/dev/null; then
-              echo "::error::Cannot fetch $repo (module branch). This is required for npm and Cargo. Ask the upstream owner for read access, then configure RAPIDONE_MODULES_TOKEN as a repository Actions secret with only those repositories' read permission. No installer was published."
-              exit 1
+            if git ls-remote --exit-code "https://github.com/$repo.git" refs/heads/module >/dev/null 2>&1; then
+              echo "$repo accessible"
+            else
+              echo "::warning::$repo cannot be fetched (private, unavailable, or access not granted). This is an upstream dependency, not a compiler error. Official upstream release mirroring is the fallback until access is granted."
+              missing=true
             fi
           done
+          if [[ "$missing" == true ]]; then
+            echo 'available=false' >> "$GITHUB_OUTPUT"
+            echo 'Private module access unavailable: skipping source compilation.' >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo 'available=true' >> "$GITHUB_OUTPUT"
+            echo 'Both upstream modules accessible: enabling source compilation.' >> "$GITHUB_STEP_SUMMARY"
+          fi
 
   build:
     needs: [sync, dependency-check]
-    if: needs.sync.outputs.build == 'true' && needs.dependency-check.result == 'success'
+    if: needs.sync.outputs.build == 'true' && needs.dependency-check.outputs.available == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -279,3 +308,76 @@ jobs:
 
           echo "### Published RapidOne $TAG" >> "$GITHUB_STEP_SUMMARY"
           echo "https://github.com/$GH_REPO/releases/tag/$TAG" >> "$GITHUB_STEP_SUMMARY"
+
+  mirror-upstream-binaries:
+    needs: [sync, dependency-check]
+    if: needs.sync.outputs.mirror_needed == 'true' && needs.dependency-check.outputs.available != 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+      UPSTREAM_RELEASE: ${{ needs.sync.outputs.upstream_release }}
+      MIRROR_TAG: ${{ needs.sync.outputs.mirror_tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Mirror official upstream binaries with provenance and checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Another run may have mirrored the release before we started.
+          if gh release view "$MIRROR_TAG" >/dev/null 2>&1; then
+            echo "Already mirrored $MIRROR_TAG" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git remote add upstream https://github.com/crispin81/RapidOne.git
+          git fetch --no-tags upstream "refs/tags/$UPSTREAM_RELEASE"
+          official_commit="$(git rev-parse 'FETCH_HEAD^{commit}')"
+          echo "Official release tag $UPSTREAM_RELEASE at $official_commit"
+
+          if ! git ls-remote --exit-code --tags origin "refs/tags/$MIRROR_TAG" >/dev/null 2>&1; then
+            git tag -a "$MIRROR_TAG" "$official_commit" -m "Mirror of upstream RapidOne $UPSTREAM_RELEASE, not compiled by this fork"
+            git push origin "refs/tags/$MIRROR_TAG"
+          fi
+
+          mkdir -p out
+          gh release download "$UPSTREAM_RELEASE" -R crispin81/RapidOne -D out
+          cd out
+          for f in RapidCull_android.apk RapidOne_linux_amd64.deb RapidOne_linux_x86_64.AppImage \
+                   RapidOne_mac_apple_silicon.dmg RapidOne_windows_x64.msi \
+                   RapidOne_windows_x64_setup.exe SHA256SUMS.txt; do
+            test -s "$f" || { echo "::error::Upstream release lacks $f"; exit 1; }
+          done
+          sha256sum --check SHA256SUMS.txt
+          cd ..
+          cat > release-notes.md <<EOF
+          ## Official upstream binary mirror — NOT locally compiled
+
+          These are the **unaltered** files published by [crispin81/RapidOne](https://github.com/crispin81/RapidOne/releases/tag/$UPSTREAM_RELEASE).
+          Their SHA256 checksums were verified against the upstream release's SHA256SUMS.txt before mirroring.
+
+          - Upstream release: $UPSTREAM_RELEASE
+          - Upstream release commit: $official_commit
+          - Build provenance: **upstream's published binaries, copied unchanged**.
+          - This fork cannot compile from source unless its CI has authorized access to
+            `crispin81/RapidCulling-module` and `crispin81/RapidRetouch-module`.
+          - Upstream and these mirrored unsigned installers are not re-signed by this fork.
+          EOF
+
+          gh release create "$MIRROR_TAG" out/* \
+            --verify-tag \
+            --title "RapidOne $UPSTREAM_RELEASE (official upstream binary mirror)" \
+            --notes-file release-notes.md \
+            --latest
+
+          echo "### Published $MIRROR_TAG" >> "$GITHUB_STEP_SUMMARY"
+          echo "Source: https://github.com/crispin81/RapidOne/releases/tag/$UPSTREAM_RELEASE" >> "$GITHUB_STEP_SUMMARY"
+          echo "Mirror: https://github.com/$GH_REPO/releases/tag/$MIRROR_TAG" >> "$GITHUB_STEP_SUMMARY"
+
