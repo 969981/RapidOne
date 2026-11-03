@@ -425,7 +425,53 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $version = $env:TARGET_VERSION -replace '^v', ''
+          $version = if ($env:TARGET_TAG.StartsWith('upstream-v')) {
+            $env:TARGET_TAG.Substring('upstream-v'.Length)
+          } else {
+            (($env:TARGET_TAG -replace '^v', '') -replace '-(sync|manual)\\..*
+          ./scripts/build-windows-portable.ps1 `
+            -MsiPath download/RapidOne_windows_x64.msi `
+            -Version $version `
+            -OutputDir portable
+          $zip = Get-Item "portable/RapidOne_${version}_windows_x64_portable.zip"
+          $hash = (Get-FileHash -LiteralPath $zip.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash *$($zip.Name)" | Set-Content -Path "portable/RapidOne_windows_x64_portable.sha256.txt" -Encoding Ascii
+          Write-Host "SHA256: $hash"
+
+      - name: Upload portable archive and label its provenance
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $assets = @(Get-ChildItem -Path portable -File |
+            Where-Object { $_.Name -like '*.zip' -or $_.Name -like '*.sha256.txt' } |
+            ForEach-Object { $_.FullName })
+          if ($assets.Count -ne 2) { throw "Expected ZIP and SHA256, found $($assets.Count)" }
+          gh release upload $env:TARGET_TAG @assets -R $env:GH_REPO --clobber
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to upload portable ZIP' }
+          $body = gh release view $env:TARGET_TAG -R $env:GH_REPO --json body --jq '.body'
+          $note = @'
+
+          ### Windows portable ZIP (derived package)
+
+          The extra Windows ZIP is repackaged from this release's MSI using
+          administrative extraction; no MSI installation is performed.
+          Launch with `Start-RapidOne-Portable.cmd`; `Data/` is writable beside the app.
+          **For official-upstream binary mirrors, app-data isolation is best-effort.**
+          The upstream EXE does not contain this fork's native portable-mode changes,
+          and Tauri / the privately hosted Cull and Retouch modules may still write
+          into Windows known folders. Photo edits remain beside photo files in `sidecars/`.
+          The portable ZIP has its own `RapidOne_windows_x64_portable.sha256.txt`;
+          it is not covered by the original upstream checksum manifest.
+          '@
+          if ($body -notmatch '### Windows portable ZIP') {
+            ($body + "`n" + $note) | Set-Content -Path portable-release-notes.md -Encoding UTF8
+            gh release edit $env:TARGET_TAG -R $env:GH_REPO --notes-file portable-release-notes.md
+            if ($LASTEXITCODE -ne 0) { throw 'Failed to update release provenance note' }
+          }
+          Write-Host "Portable ZIP: https://github.com/$env:GH_REPO/releases/tag/$env:TARGET_TAG"
+
+, '')
+          }
           ./scripts/build-windows-portable.ps1 `
             -MsiPath download/RapidOne_windows_x64.msi `
             -Version $version `
