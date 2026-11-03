@@ -42,6 +42,7 @@ pub mod prof;
 pub mod paramtable;
 pub mod preset;
 pub mod presets;
+pub mod portable;
 pub mod preview;
 pub mod sidecar;
 pub mod subject;
@@ -86,14 +87,14 @@ pub fn run() {
             if let Ok(dir) = app.path().resource_dir() {
                 crate::mask::set_resource_dir(dir);
             }
-            if let Ok(dir) = app.path().document_dir() {
+            if let Ok(dir) = crate::portable::document_dir(app.handle()) {
                 crate::userprofiles::set_dir(dir.join("RapidOne").join("Profiles"));
             }
             // Lens profiles (lensfun.rs): newer Lensfun files in the app's data folder, the
             // user's own in Documents/RapidOne/Lens profiles.
             crate::lensfun::set_dirs(
-                app.path().app_local_data_dir().ok().map(|d| d.join("lensfun")),
-                app.path().document_dir().ok().map(|d| d.join("RapidOne").join("Lens profiles")),
+                crate::portable::app_local_data_dir(app.handle()).ok().map(|d| d.join("lensfun")),
+                crate::portable::document_dir(app.handle()).ok().map(|d| d.join("RapidOne").join("Lens profiles")),
             );
             Ok(())
         })
