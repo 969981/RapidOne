@@ -388,10 +388,11 @@ jobs:
           echo "Source: https://github.com/crispin81/RapidOne/releases/tag/$UPSTREAM_RELEASE" >> "$GITHUB_STEP_SUMMARY"
           echo "Mirror: https://github.com/$GH_REPO/releases/tag/$MIRROR_TAG" >> "$GITHUB_STEP_SUMMARY"
 
+
   windows-portable:
     needs: [sync, dependency-check, mirror-upstream-binaries, publish]
-    # Run against a verified upstream mirror, or the fork's actual source build
-    # after all three desktop builds and its publish step have succeeded.
+    # The fallback mirrors official installers. Source builds are packaged
+    # only when all platform builds and their release publish succeeded.
     if: >-
       always() && needs.sync.result == 'success' &&
       ((needs.sync.outputs.portable_needed == 'true' &&
@@ -404,109 +405,69 @@ jobs:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       GH_REPO: ${{ github.repository }}
       TARGET_TAG: ${{ needs.publish.result == 'success' && needs.sync.outputs.tag || needs.sync.outputs.mirror_tag }}
-      TARGET_VERSION: ${{ needs.sync.outputs.upstream_release }}
     steps:
       - uses: actions/checkout@v4
         with:
           ref: main
 
-      - name: Download existing signed-or-unsigned Windows MSI asset
+      - name: Download Windows installer
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           gh release view $env:TARGET_TAG -R $env:GH_REPO | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw 'Release does not exist' }
           New-Item -ItemType Directory -Path download -Force | Out-Null
           gh release download $env:TARGET_TAG -R $env:GH_REPO -D download -p 'RapidOne_windows_x64.msi'
           if ($LASTEXITCODE -ne 0 -or !(Test-Path download/RapidOne_windows_x64.msi)) {
-            throw 'Release MSI not available for portable extraction'
+            throw 'No Windows MSI found in release'
           }
 
-      - name: Package install-free Windows portable ZIP
+      - name: Package Windows portable ZIP
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $version = if ($env:TARGET_TAG.StartsWith('upstream-v')) {
-            $env:TARGET_TAG.Substring('upstream-v'.Length)
+          if ($env:TARGET_TAG.StartsWith('upstream-v')) {
+            $version = $env:TARGET_TAG.Substring('upstream-v'.Length)
           } else {
-            (($env:TARGET_TAG -replace '^v', '') -replace '-(sync|manual)\\..*
+            $version = ($env:TARGET_TAG -replace '^v', '') -replace '-(sync|manual)\\..*$', ''
+          }
           ./scripts/build-windows-portable.ps1 `
             -MsiPath download/RapidOne_windows_x64.msi `
             -Version $version `
             -OutputDir portable
           $zip = Get-Item "portable/RapidOne_${version}_windows_x64_portable.zip"
           $hash = (Get-FileHash -LiteralPath $zip.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
-          "$hash *$($zip.Name)" | Set-Content -Path "portable/RapidOne_windows_x64_portable.sha256.txt" -Encoding Ascii
+          "$hash *$($zip.Name)" | Set-Content -Path 'portable/RapidOne_windows_x64_portable.sha256.txt' -Encoding Ascii
           Write-Host "SHA256: $hash"
 
-      - name: Upload portable archive and label its provenance
+      - name: Publish derived portable ZIP and document provenance
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           $assets = @(Get-ChildItem -Path portable -File |
             Where-Object { $_.Name -like '*.zip' -or $_.Name -like '*.sha256.txt' } |
             ForEach-Object { $_.FullName })
-          if ($assets.Count -ne 2) { throw "Expected ZIP and SHA256, found $($assets.Count)" }
+          if ($assets.Count -ne 2) { throw "Expected ZIP and checksum, found $($assets.Count)" }
           gh release upload $env:TARGET_TAG @assets -R $env:GH_REPO --clobber
-          if ($LASTEXITCODE -ne 0) { throw 'Failed to upload portable ZIP' }
+          if ($LASTEXITCODE -ne 0) { throw 'Upload failed' }
+
           $body = gh release view $env:TARGET_TAG -R $env:GH_REPO --json body --jq '.body'
           $note = @'
 
           ### Windows portable ZIP (derived package)
 
-          The extra Windows ZIP is repackaged from this release's MSI using
-          administrative extraction; no MSI installation is performed.
-          Launch with `Start-RapidOne-Portable.cmd`; `Data/` is writable beside the app.
-          **For official-upstream binary mirrors, app-data isolation is best-effort.**
-          The upstream EXE does not contain this fork's native portable-mode changes,
-          and Tauri / the privately hosted Cull and Retouch modules may still write
-          into Windows known folders. Photo edits remain beside photo files in `sidecars/`.
-          The portable ZIP has its own `RapidOne_windows_x64_portable.sha256.txt`;
-          it is not covered by the original upstream checksum manifest.
+          This additional ZIP is repackaged from the release MSI using Windows
+          administrative extraction. Start with Start-RapidOne-Portable.cmd.
+          In the official-upstream binary mirror, app-data redirection is only
+          best-effort: the unmodified EXE lacks the fork's native portable
+          paths and the private Cull/Retouch modules are not audited.
+          Photo edits remain beside the original photos in sidecars folders.
+          Use the separate RapidOne_windows_x64_portable.sha256.txt to verify
+          this ZIP; upstream SHA256SUMS.txt only covers original upstream files.
           '@
           if ($body -notmatch '### Windows portable ZIP') {
             ($body + "`n" + $note) | Set-Content -Path portable-release-notes.md -Encoding UTF8
             gh release edit $env:TARGET_TAG -R $env:GH_REPO --notes-file portable-release-notes.md
-            if ($LASTEXITCODE -ne 0) { throw 'Failed to update release provenance note' }
+            if ($LASTEXITCODE -ne 0) { throw 'Failed to update release note' }
           }
           Write-Host "Portable ZIP: https://github.com/$env:GH_REPO/releases/tag/$env:TARGET_TAG"
-
-, '')
-          }
-          ./scripts/build-windows-portable.ps1 `
-            -MsiPath download/RapidOne_windows_x64.msi `
-            -Version $version `
-            -OutputDir portable
-          $zip = Get-Item "portable/RapidOne_${version}_windows_x64_portable.zip"
-          $hash = (Get-FileHash -LiteralPath $zip.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
-          "$hash *$($zip.Name)" | Set-Content -Path "portable/RapidOne_windows_x64_portable.sha256.txt" -Encoding Ascii
-          Write-Host "SHA256: $hash"
-
-      - name: Upload portable archive and label its provenance
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          gh release upload $env:TARGET_TAG -R $env:GH_REPO --clobber `
-            portable/*.zip portable/*.sha256.txt
-          if ($LASTEXITCODE -ne 0) { throw 'Failed to upload portable ZIP' }
-          $body = gh release view $env:TARGET_TAG -R $env:GH_REPO --json body --jq '.body'
-          $note = @'
-
-          ### Windows portable ZIP (derived package)
-
-          The extra Windows ZIP is repackaged from this release's MSI using
-          administrative extraction; no MSI installation is performed.
-          Launch with `Start-RapidOne-Portable.cmd`; `Data/` is writable beside the app.
-          **For official-upstream binary mirrors, app-data isolation is best-effort.**
-          The upstream EXE does not contain this fork's native portable-mode changes,
-          and Tauri / the privately hosted Cull and Retouch modules may still write
-          into Windows known folders. Photo edits remain beside photo files in `sidecars/`.
-          The portable ZIP has its own `RapidOne_windows_x64_portable.sha256.txt`;
-          it is not covered by the original upstream checksum manifest.
-          '@
-          if ($body -notmatch '### Windows portable ZIP') {
-            ($body + "`n" + $note) | Set-Content -Path portable-release-notes.md -Encoding UTF8
-            gh release edit $env:TARGET_TAG -R $env:GH_REPO --notes-file portable-release-notes.md
-            if ($LASTEXITCODE -ne 0) { throw 'Failed to update release provenance note' }
-          }
-          Write-Host "Portable ZIP: https://github.com/$env:GH_REPO/releases/tag/$env:TARGET_TAG"
-
