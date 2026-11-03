@@ -9,7 +9,7 @@ use tauri::Manager;
 const EXTENSION: &str = "rpp";
 
 fn folder(app: &tauri::AppHandle) -> Result<PathBuf, String> {
-    let dir = app.path().app_data_dir().map_err(|e| e.to_string())?.join("presets");
+    let dir = crate::portable::app_data_dir(app)?.join("presets");
     std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     Ok(dir)
 }
