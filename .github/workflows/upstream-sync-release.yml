@@ -1,0 +1,281 @@
+name: Sync upstream and build RapidOne releases
+
+on:
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+    inputs:
+      force_release:
+        description: 'Build again even if upstream has not changed'
+        required: false
+        type: boolean
+        default: false
+  # Bootstrap one build after installing this workflow.
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/upstream-sync-release.yml'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: rapidone-upstream-sync-release
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    outputs:
+      build: ${{ steps.sync.outputs.build }}
+      tag: ${{ steps.sync.outputs.tag }}
+      sha: ${{ steps.sync.outputs.sha }}
+      upstream_sha: ${{ steps.sync.outputs.upstream_sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+      - id: sync
+        name: Merge upstream changes without overwriting the fork's CI
+        shell: bash
+        env:
+          FORCE: ${{ inputs.force_release || 'false' }}
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git remote add upstream https://github.com/crispin81/RapidOne.git
+          git fetch --no-tags upstream main
+          upstream_sha="$(git rev-parse refs/remotes/upstream/main)"
+          changed=false
+
+          if ! git merge-base --is-ancestor "$upstream_sha" HEAD; then
+            # Never force-push: preserve local CI/history, stop safely on conflict.
+            git merge --no-ff --no-edit "$upstream_sha"
+            git push origin HEAD:main
+            changed=true
+          fi
+
+          echo "upstream_sha=$upstream_sha" >> "$GITHUB_OUTPUT"
+          if [[ "$changed" != true && "$FORCE" != true && "$GITHUB_EVENT_NAME" != push ]]; then
+            echo 'No upstream change. Skip build.'
+            echo 'build=false' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          sha="$(git rev-parse HEAD)"
+          version="$(node -p 'require("./package.json").version')"
+          tag="v${version}-sync.${sha:0:12}"
+          if [[ "$FORCE" == true && "$changed" != true ]]; then
+            tag="v${version}-manual.${sha:0:12}.${GITHUB_RUN_ID}"
+          fi
+          if ! git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1; then
+            git tag -a "$tag" -m "RapidOne upstream $upstream_sha" "$sha"
+            git push origin "refs/tags/$tag"
+          fi
+          {
+            echo 'build=true'
+            echo "tag=$tag"
+            echo "sha=$sha"
+          } >> "$GITHUB_OUTPUT"
+          echo "Source: $sha / upstream: $upstream_sha / tag: $tag"
+
+  dependency-check:
+    needs: sync
+    if: needs.sync.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Authenticate to optional private upstream module repositories
+        shell: bash
+        env:
+          MODULES_TOKEN: ${{ secrets.RAPIDONE_MODULES_TOKEN }}
+        run: |
+          if [[ -n "$MODULES_TOKEN" ]]; then
+            git config --global url."https://x-access-token:${MODULES_TOKEN}@github.com/".insteadOf "https://github.com/"
+          fi
+      - name: Verify source dependencies are fetchable
+        shell: bash
+        env:
+          GIT_TERMINAL_PROMPT: '0'
+        run: |
+          set -euo pipefail
+          for repo in crispin81/RapidCulling-module crispin81/RapidRetouch-module; do
+            echo "Checking $repo (branch module)"
+            if ! git ls-remote --exit-code "https://github.com/$repo.git" refs/heads/module >/dev/null; then
+              echo "::error::Cannot fetch $repo (module branch). This is required for npm and Cargo. Ask the upstream owner for read access, then configure RAPIDONE_MODULES_TOKEN as a repository Actions secret with only those repositories' read permission. No installer was published."
+              exit 1
+            fi
+          done
+
+  build:
+    needs: [sync, dependency-check]
+    if: needs.sync.outputs.build == 'true' && needs.dependency-check.result == 'success'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            triple: x86_64-unknown-linux-gnu
+            args: ''
+            config: src-tauri/tauri.release.conf.json
+          - os: windows-latest
+            triple: x86_64-pc-windows-msvc
+            args: ''
+            config: src-tauri/tauri.release.conf.json src-tauri/tauri.release.windows.conf.json
+          - os: macos-latest
+            triple: aarch64-apple-darwin
+            args: '--target aarch64-apple-darwin'
+            config: src-tauri/tauri.release.conf.json
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.sync.outputs.tag }}
+
+      - name: Configure optional source module authentication
+        shell: bash
+        env:
+          MODULES_TOKEN: ${{ secrets.RAPIDONE_MODULES_TOKEN }}
+        run: |
+          if [[ -n "$MODULES_TOKEN" ]]; then
+            git config --global url."https://x-access-token:${MODULES_TOKEN}@github.com/".insteadOf "https://github.com/"
+          fi
+
+      - name: Install Linux build prerequisites (ONNX WebGPU requires Ubuntu 24.04+)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev \
+            librsvg2-dev patchelf build-essential rpm libfuse2t64 libssl-dev pkg-config
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.triple }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: 'src-tauri -> target'
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            models/
+          key: rapidone-models-${{ runner.os }}-${{ hashFiles('scripts/fetch-models.mjs') }}
+
+      - name: Install Node and TypeScript dependencies
+        run: npm ci
+
+      - name: Fetch distributable AI models
+        run: npm run fetch-models
+
+      - name: Prebuild to obtain Windows DirectML or Linux WebGPU libraries
+        if: runner.os == 'Windows' || runner.os == 'Linux'
+        shell: bash
+        env:
+          GIT_TERMINAL_PROMPT: '0'
+        run: |
+          set -euo pipefail
+          if [[ "$RUNNER_OS" == Linux ]]; then
+            export RUSTFLAGS='-C link-arg=-Wl,-rpath,$ORIGIN/../lib/RapidOne'
+          fi
+          cargo build --release --locked --manifest-path src-tauri/Cargo.toml
+          if [[ "$RUNNER_OS" == Linux ]]; then
+            mkdir -p src-tauri/linux-lib
+            test -s src-tauri/target/release/libwebgpu_dawn.so
+            cp src-tauri/target/release/libwebgpu_dawn.so src-tauri/linux-lib/
+          fi
+
+      - name: Repair upstream Windows CRT directory glob for CI
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          # The upstream prepare-release.sh has extra literal whitespace
+          # in the Visual Studio CRT glob. Repair in the runner only.
+          sed -i 's/\.CRT          "/.CRT" "/' scripts/prepare-release.sh
+
+      - name: Stage uv and the pinned Retouch Python engine
+        shell: bash
+        env:
+          GIT_TERMINAL_PROMPT: '0'
+        run: bash scripts/prepare-release.sh ${{ matrix.triple }}
+
+      - name: Install patched AppImage GTK hook from upstream
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          mkdir -p ~/.cache/tauri
+          cp .github/appimage/linuxdeploy-plugin-gtk.sh ~/.cache/tauri/linuxdeploy-plugin-gtk.sh
+          chmod +x ~/.cache/tauri/linuxdeploy-plugin-gtk.sh
+
+      - name: Build and attach platform installers to draft release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APPIMAGE_EXTRACT_AND_RUN: '1'
+        with:
+          tagName: ${{ needs.sync.outputs.tag }}
+          releaseName: 'RapidOne ${{ needs.sync.outputs.tag }}'
+          releaseBody: |
+            Auto-built from crispin81/RapidOne main.
+            Upstream source: ${{ needs.sync.outputs.upstream_sha }}
+            Fork commit: ${{ needs.sync.outputs.sha }}
+            Includes Edit models. Retouch's Python engine is set up at first launch.
+            Unsigned desktop installers: see README for platform guidance.
+          releaseDraft: true
+          prerelease: false
+          args: ${{ matrix.args }} --config ${{ matrix.config }}
+
+  publish:
+    needs: [sync, build]
+    if: needs.sync.outputs.build == 'true' && needs.build.result == 'success'
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ needs.sync.outputs.tag }}
+    steps:
+      - name: Add stable filenames, checksums, and publish
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          gh release download "$TAG" -D out
+          cd out
+          shopt -s nullglob
+
+          win_exe=(*_x64-setup.exe)
+          win_msi=(*_x64_en-US.msi)
+          mac=(*_aarch64.dmg)
+          linux_app=(*_amd64.AppImage)
+          linux_deb=(*_amd64.deb)
+          for name in win_exe win_msi mac linux_app linux_deb; do
+            eval "count=\${#${name}[@]}"
+            if (( count != 1 )); then
+              echo "::error::Expected exactly one asset for $name, got $count"
+              exit 1
+            fi
+          done
+
+          cp "${win_exe[0]}" RapidOne_windows_x64_setup.exe
+          cp "${win_msi[0]}" RapidOne_windows_x64.msi
+          cp "${mac[0]}" RapidOne_mac_apple_silicon.dmg
+          cp "${linux_app[0]}" RapidOne_linux_x86_64.AppImage
+          cp "${linux_deb[0]}" RapidOne_linux_amd64.deb
+
+          sha256sum * > SHA256SUMS.txt
+          gh release upload "$TAG" --clobber \
+            RapidOne_windows_x64_setup.exe \
+            RapidOne_windows_x64.msi \
+            RapidOne_mac_apple_silicon.dmg \
+            RapidOne_linux_x86_64.AppImage \
+            RapidOne_linux_amd64.deb SHA256SUMS.txt
+          gh release edit "$TAG" --draft=false --latest
+
+          echo "### Published RapidOne $TAG" >> "$GITHUB_STEP_SUMMARY"
+          echo "https://github.com/$GH_REPO/releases/tag/$TAG" >> "$GITHUB_STEP_SUMMARY"
