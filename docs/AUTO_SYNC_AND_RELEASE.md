@@ -53,3 +53,12 @@
 - 上游模型下载服务器、私有 module 源码、`ort` 预构建二进制、macOS/Windows 签名、CRT/DirectML staging 可能继续导致失败。成功执行的安装包仍应做首次启动功能测试。
 - `RapidCull_android.apk` 来自另一个 Android 构建工程，当前桌面 CI **不声称**构建 Android APK。
 - Actions 写入 `main` 的自动提交不会被 `GITHUB_TOKEN` 再次触发常规 push 工作流，因此本工作流自行编译与发布，避免重复触发。
+
+## Windows 绿色版（Portable ZIP）
+
+- 现有 Windows MSI 可由 Windows Actions 使用 `msiexec /a` 进行管理员提取，创建免安装 ZIP。
+- 每个已同步的正式 Release 将附加 `RapidOne_<version>_windows_x64_portable.zip` 及独立的 SHA256 校验文件。
+- 解压后运行 `Start-RapidOne-Portable.cmd`，它设置相对于软件目录的 `Data/` 环境变量目录。
+- 目前由上游二进制改包，**尚不能保证所有数据都在软件目录**；只有今后使用本仓库源码重新编译时，主程序新增的便携路径逻辑才会生效，Cull/Retouch 模块仍需单独验证。
+- 编辑历史的 `.rpd` 和图片缓存按上游设计留在照片旁的 `sidecars/`，随软件目录迁移时不会自动搬运。
+- 具体操作和限制见 [WINDOWS_PORTABLE.md](WINDOWS_PORTABLE.md)。
