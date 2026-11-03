@@ -410,7 +410,29 @@ jobs:
         with:
           ref: main
 
+      - id: portable-check
+        name: Check existing portable asset before downloading large MSI
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = if ($env:TARGET_TAG.StartsWith('upstream-v')) {
+            $env:TARGET_TAG.Substring('upstream-v'.Length)
+          } else {
+            ($env:TARGET_TAG -replace '^v', '') -replace '-(sync|manual)\\..*$', ''
+          }
+          $file = "RapidOne_${version}_windows_x64_portable.zip"
+          $names = @(gh release view $env:TARGET_TAG -R $env:GH_REPO --json assets --jq '.assets[].name')
+          if ($LASTEXITCODE -ne 0) { throw 'Unable to inspect release assets' }
+          if ($names -contains $file) {
+            "needed=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+            Write-Host "Already published $file; skipping redundant download and ZIP upload."
+          } else {
+            "needed=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+            Write-Host "$file not yet published; starting MSI repackaging."
+          }
+
       - name: Download Windows installer
+        if: steps.portable-check.outputs.needed == 'true'
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -423,6 +445,7 @@ jobs:
           }
 
       - name: Package Windows portable ZIP
+        if: steps.portable-check.outputs.needed == 'true'
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -441,6 +464,7 @@ jobs:
           Write-Host "SHA256: $hash"
 
       - name: Publish derived portable ZIP and document provenance
+        if: steps.portable-check.outputs.needed == 'true'
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -448,7 +472,7 @@ jobs:
             Where-Object { $_.Name -like '*.zip' -or $_.Name -like '*.sha256.txt' } |
             ForEach-Object { $_.FullName })
           if ($assets.Count -ne 2) { throw "Expected ZIP and checksum, found $($assets.Count)" }
-          gh release upload $env:TARGET_TAG @assets -R $env:GH_REPO --clobber
+          gh release upload $env:TARGET_TAG @assets -R $env:GH_REPO
           if ($LASTEXITCODE -ne 0) { throw 'Upload failed' }
 
           $body = gh release view $env:TARGET_TAG -R $env:GH_REPO --json body --jq '.body'
