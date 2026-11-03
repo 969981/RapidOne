@@ -122,7 +122,7 @@ jobs:
           - os: windows-latest
             triple: x86_64-pc-windows-msvc
             args: ''
-            config: src-tauri/tauri.release.conf.json src-tauri/tauri.release.windows.conf.json
+            config: src-tauri/tauri.release.conf.json --config src-tauri/tauri.release.windows.conf.json
           - os: macos-latest
             triple: aarch64-apple-darwin
             args: '--target aarch64-apple-darwin'
@@ -268,7 +268,7 @@ jobs:
           cp "${linux_app[0]}" RapidOne_linux_x86_64.AppImage
           cp "${linux_deb[0]}" RapidOne_linux_amd64.deb
 
-          sha256sum * > SHA256SUMS.txt
+          find . -maxdepth 1 -type f ! -name SHA256SUMS.txt -printf '%f\\0' | sort -z | xargs -0 -r sha256sum > SHA256SUMS.txt
           gh release upload "$TAG" --clobber \
             RapidOne_windows_x64_setup.exe \
             RapidOne_windows_x64.msi \
