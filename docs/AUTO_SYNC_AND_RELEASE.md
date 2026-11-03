@@ -6,9 +6,9 @@
 
 - 每 15 分钟检查 `crispin81/RapidOne:main`。
 - 如上游新提交不在本仓库 `main` 的历史中，以 **merge** 保留本仓库 Actions 工作流及其他提交；有冲突时停止，不强推、不覆盖历史。
-- 没有新提交时直接退出，不运行耗时编译。
+- 没有新提交时不运行耗时源码编译；每次仍独立检查上游最新正式 Release，避免漏掉源码已同步但安装包之后才发布的情况。
 - 首次安装本工作流触发一个引导构建；Actions 中也可用 `workflow_dispatch` 手动强制重新发布。
-- 同步时以当前 `package.json` 版本和 commit SHA 创建唯一 tag，例如 `v1.2.1-sync.abcdef123456`。
+- 上游有新源码提交时以当前 `package.json` 版本和 commit SHA 创建源码构建 tag，例如 `v1.2.1-sync.abcdef123456`。官方安装包镜像使用独立标签 `upstream-v1.2.1`。
 - GitHub 定时工作流为尽力调度，15 分钟是检查计划而不是严格的延迟保证。
 
 ## 已确认的上游依赖限制（2026-11-03）
@@ -20,7 +20,7 @@
 
 这两个仓库通过公共 GitHub API 均无法访问（404）；首次 Actions 运行中匿名 `git ls-remote` 也返回无法读取 GitHub 用户名。无法判定它们是私有、已删除还是仅对特定用户开放。**没有获得这些源码依赖的合法读取权限，无法进行完整源码编译。**
 
-本工作流在编译前调用 `git ls-remote` 验证它们。失败会显示明确错误，Windows/macOS/Linux 构建和发布均停止，不浪费主要编译额度，也不会把上游现成二进制伪称为自编译。
+本工作流在编译前调用 `git ls-remote` 验证它们。检查无法访问时不会假装本地编译成功，源码构建矩阵直接跳过。若上游已有新正式 Release，改用 **官方安装包校验镜像** 流程：下载上游安装包、按 SHA256SUMS.txt 全量核对并原样发布到本仓库；Release 标题和说明明确标注 `official upstream binary mirror — NOT locally compiled`。上游未发布安装包的最新源码提交不会被错误标记为已构建。
 
 ### 怎样解除限制
 
@@ -29,6 +29,14 @@
 3. 在 **Actions → Sync upstream and build RapidOne releases → Run workflow** 中勾选 `force_release` 后重试。不要把令牌写入仓库代码、Issue 或 Actions 日志。
 
 注意：本工作流目前不会创建私有仓库权限，也不能替维护者授权。
+
+## 没有模块权限时的可用备用发布路径
+
+- 每次定时运行仍检查 `crispin81/RapidOne/releases/latest`，发现本仓库尚未镜像的新正式版本则启动一次镜像任务。
+- 只转载原版官方构建的 Windows x64 EXE/MSI、macOS Apple Silicon DMG、Linux AppImage/DEB、RapidCull Android APK 及官方 SHA256SUMS.txt。
+- 对照上游 SHA256SUMS 逐一核验后才创建本仓库 Release，版本标签为 `upstream-vX.Y.Z`，正文明确写明是官方二进制的原样镜像。
+- 此路径 **不是本仓库源码编译**，但可在目前上游私有模块不可访问时持续同步和发布上游已发布的安装包。下载文件较大，受 Actions 网络、空间与 GitHub Release 限制；失败需查看对应任务日志。
+- 一旦 `RAPIDONE_MODULES_TOKEN` 被正确授权，编译工作流便恢复尝试源码构建，三平台同时成功后再发布 `vX.Y.Z-sync.<commit>` 版本。
 
 ## 编译与发布目标
 
