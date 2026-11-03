@@ -374,7 +374,7 @@ jobs:
           - Upstream release commit: $official_commit
           - Build provenance: **upstream's published binaries, copied unchanged**.
           - This fork cannot compile from source unless its CI has authorized access to
-            `crispin81/RapidCulling-module` and `crispin81/RapidRetouch-module`.
+            crispin81/RapidCulling-module and crispin81/RapidRetouch-module.
           - Upstream and these mirrored unsigned installers are not re-signed by this fork.
           EOF
 
@@ -429,7 +429,7 @@ jobs:
           if ($env:TARGET_TAG.StartsWith('upstream-v')) {
             $version = $env:TARGET_TAG.Substring('upstream-v'.Length)
           } else {
-            $version = ($env:TARGET_TAG -replace '^v', '') -replace '-(sync|manual)\\..*$', ''
+            $version = ($env:TARGET_TAG -replace '^v', '') -replace '-(sync|manual)\..*$', ''
           }
           ./scripts/build-windows-portable.ps1 `
             -MsiPath download/RapidOne_windows_x64.msi `
@@ -471,3 +471,36 @@ jobs:
             if ($LASTEXITCODE -ne 0) { throw 'Failed to update release note' }
           }
           Write-Host "Portable ZIP: https://github.com/$env:GH_REPO/releases/tag/$env:TARGET_TAG"
+
+  repair-existing-mirror-notes:
+    needs: sync
+    if: github.event_name == 'push' && needs.sync.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ needs.sync.outputs.mirror_tag }}
+    steps:
+      - name: Repair older release-note formatting if necessary
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release view "$TAG" --json body --jq '.body' > release-body.md
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path("release-body.md")
+          original = p.read_text(encoding="utf-8")
+          fixed = original.replace("   and .", "   crispin81/RapidCulling-module and crispin81/RapidRetouch-module.")
+          p.write_text(fixed, encoding="utf-8")
+          if original != fixed:
+              Path("needs-repair").touch()
+          PY
+          if [[ -f needs-repair ]]; then
+            gh release edit "$TAG" --notes-file release-body.md
+            echo "Repaired module names in the previous release notes" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "No release-note repair necessary" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
