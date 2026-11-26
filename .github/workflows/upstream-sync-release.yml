@@ -57,7 +57,33 @@ jobs:
 
           if ! git merge-base --is-ancestor "$upstream_sha" HEAD; then
             # Never force-push: preserve local CI/history, stop safely on conflict.
-            git merge --no-ff --no-edit "$upstream_sha"
+            before="$(git rev-parse HEAD)"
+            if ! git merge --no-ff --no-commit "$upstream_sha"; then
+              # Reviewed one-file conflict: retain all new upstream commands and portable paths.
+              test "$(git diff --name-only --diff-filter=U)" = "src-tauri/src/lib.rs"
+              test "$(git rev-parse :2:src-tauri/src/lib.rs)" = "d6300357567a41959e1afd617b8b3a181f398f1d"
+              test "$(git rev-parse :3:src-tauri/src/lib.rs)" = "ab0eb2399c433c7d56dd19a01c1ec277551bfb4d"
+              git checkout --theirs -- src-tauri/src/lib.rs
+              python3 - <<'PY'
+          from pathlib import Path
+          p = Path("src-tauri/src/lib.rs")
+          s = p.read_text(encoding="utf-8")
+          for old, new, count in [
+              ("pub mod presets;\n", "pub mod presets;\npub mod portable;\n", 1),
+              ("app.path().app_local_data_dir()", "crate::portable::app_local_data_dir(app.handle())", 2),
+              ("app.path().document_dir()", "crate::portable::document_dir(app.handle())", 2),
+          ]:
+              if s.count(old) != count:
+                  raise SystemExit(f"Unexpected RapidOne merge layout: {old}")
+              s = s.replace(old, new)
+          p.write_text(s, encoding="utf-8")
+          PY
+              git add src-tauri/src/lib.rs
+            fi
+            git restore --source="$before" --staged --worktree -- .github/workflows
+            test -z "$(git ls-files -u)"
+            git diff --cached --check
+            git commit -m "chore(sync): merge upstream $upstream_sha preserving portable paths"
             git push origin HEAD:main
             changed=true
           fi
