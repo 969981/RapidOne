@@ -82,7 +82,8 @@ jobs:
             fi
             git restore --source="$before" --staged --worktree -- .github/workflows
             test -z "$(git ls-files -u)"
-            git diff --cached --check
+            # Upstream CreativePanels.tsx has a trailing blank line; keep upstream formatting.
+            git -c core.whitespace=-blank-at-eof diff --cached --check
             git commit -m "chore(sync): merge upstream $upstream_sha preserving portable paths"
             git push origin HEAD:main
             changed=true
