@@ -524,8 +524,8 @@ jobs:
           Write-Host "Portable ZIP: https://github.com/$env:GH_REPO/releases/tag/$env:TARGET_TAG"
 
   repair-existing-mirror-notes:
-    needs: sync
-    if: github.event_name == 'push' && needs.sync.result == 'success'
+    needs: [sync, mirror-upstream-binaries, windows-portable]
+    if: always() && github.event_name == 'push' && needs.sync.result == 'success' && (needs.mirror-upstream-binaries.result == 'success' || needs.mirror-upstream-binaries.result == 'skipped') && (needs.windows-portable.result == 'success' || needs.windows-portable.result == 'skipped')
     runs-on: ubuntu-latest
     permissions:
       contents: write
